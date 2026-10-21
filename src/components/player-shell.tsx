@@ -307,9 +307,9 @@ export function PlayerShell({
   useEffect(() => {
     if (!containerRef.current || !propsRef.current.url) return;
     const initialUrl = propsRef.current.url;
-    // ArtPlayer 默认 3 秒才隐藏控制栏；播放器失去鼠标悬停后缩短为 0.8 秒。
+    // ArtPlayer 默认 3 秒才隐藏控制栏；原先缩短为 0.8 秒，触屏上来不及点按钮，改为 4 秒。
     const previousControlHideTime = Artplayer.CONTROL_HIDE_TIME;
-    Artplayer.CONTROL_HIDE_TIME = 800;
+    Artplayer.CONTROL_HIDE_TIME = 4000;
 
     // 初始化每集状态
     mediaHealthyRef.current = true;
@@ -478,7 +478,7 @@ export function PlayerShell({
       if (controlHideTimer) clearTimeout(controlHideTimer);
       controlHideTimer = setTimeout(() => {
         if (!art.setting.show) art.controls.show = false;
-      }, 800);
+      }, 4000);
     };
     const hideControlsOnMouseLeave = () => {
       if (controlHideTimer) clearTimeout(controlHideTimer);
