@@ -15,7 +15,6 @@ import { rewriteM3u8, LIVE_STREAM_BASE } from '@/lib/m3u8';
  * 旧地址（缓存页 / 已下发的播放列表）不受影响。
  */
 
-const TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT || '8000', 10);
 const MAX_RETRIES = parseInt(process.env.MAX_RETRIES || '1', 10);
 const HEADER_TIMEOUT_MS = 15_000;
 const UA =
@@ -89,15 +88,24 @@ export async function handleProxyRequest(req: Request, targetUrl: string): Promi
   const range = req.headers.get('range');
   if (range) headers.Range = range;
 
+  // 客户端断开（切台/关页）时终止上游连接，防止连接泄漏
+  const controller = new AbortController();
+  const onClientAbort = () => controller.abort();
+  req.signal.addEventListener('abort', onClientAbort, { once: true });
+
   let response: Response | undefined;
   let finalUrl = targetUrl;
   let lastError: unknown = null;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
-      const result = await fetchWithSafeRedirects(targetUrl, {
-        headers,
-        signal: AbortSignal.timeout(TIMEOUT_MS),
-      });
+      // 仅对「响应头等待」限时（15s）：拿到响应头后清除计时器，body 流式透传不再受限。
+      // 之前用 AbortSignal.timeout(8s) 作用于整个响应流，分片稍大/源稍慢就 8 秒切断，
+      // 客户端重试 3 次也一样失败——「开头快、过会儿分片下载失败」就是这个原因。
+      const result = await fetchWithSafeRedirects(
+        targetUrl,
+        { headers, signal: controller.signal },
+        { headerTimeoutMs: HEADER_TIMEOUT_MS }
+      );
       response = result.res;
       finalUrl = result.finalUrl;
       lastError = null;
@@ -154,11 +162,11 @@ export async function handleProxyRequest(req: Request, targetUrl: string): Promi
 /**
  * 直播流专用长连接代理（不复用 /api/proxy）：
  *
- * /api/proxy 的 AbortSignal.timeout(TIMEOUT_MS) 作用于整个响应流，
- * 8 秒后即切断长连接——对 HTTP-FLV（单一无限长连接）是致命的。
- * 本路由改为「仅对响应头等待设超时」（fetchWithSafeRedirects 的
- * headerTimeoutMs）：fetch 拿到响应头后立即清除计时器，
- * 之后 body 无限时长流式透传，直到客户端断开。
+ * /api/proxy 与本路由一样仅对「响应头等待」限时（headerTimeoutMs），
+ * 拿到响应头后 body 流式透传不再受限（此前 /api/proxy 用
+ * AbortSignal.timeout(8s) 作用于整个响应流，分片稍大就 8 秒切断，
+ * 已改为 header-only，见 handleProxyRequest）。
+ * 本路由仍独立存在：不重试（重试对直播无意义）、放行内网自建源等。
  *
  * - 不重试（重试对直播无意义）；
  * - m3u8 manifest 仍需重写（变体/分片地址改指本路由），FLV 等纯透传；
