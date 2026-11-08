@@ -104,9 +104,12 @@ export async function pickSaveTarget(filename: string, estimatedBytes?: number):
       };
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') {
-        throw new UserCancelledError();
+        // 用户取消了文件选择器，或选择器在当前环境不可靠而自动取消
+        // （安卓 Aloha 暴露了 showSaveFilePicker 但一调就 Abort，导致点「下载本集」
+        // 直接弹「已取消下载」、下载根本没开始）：不取消整个下载，
+        // 退回内存聚合（完成后走浏览器默认下载），用户仍可在下载管理器里取消任务。
       }
-      // 文件选择失败（权限/环境）→ 落到内存聚合
+      // 文件选择失败（权限/环境/取消）→ 落到内存聚合
     }
   }
   if (estimatedBytes && estimatedBytes > 500 * 1024 * 1024) {
