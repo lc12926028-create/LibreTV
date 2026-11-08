@@ -1,5 +1,18 @@
 import { parseM3u8Playlist, type ParsedPlaylist } from './m3u8-parse';
+import { PROXY_BASE, isProxiedUri } from './m3u8';
 import { StreamingTransmuxer } from './mp4-transmuxer';
+
+/**
+ * 把下载地址改写为经本站代理的地址。
+ * 播放器侧同样走 /api/proxy（见 player-shell），下载若直连片源站，
+ * 浏览器会被上游缺失的 CORS 头拦住——播放能看、下载失败就是这个原因。
+ * 代理会对 m3u8 做重写（分片/key 均指回代理，见 proxy-handlers），
+ * 因此解析出的分片与密钥地址本身就是代理地址，后续拉取无需再改写。
+ */
+function toProxyUrl(url: string): string {
+  if (isProxiedUri(url)) return url;
+  return PROXY_BASE + encodeURIComponent(url);
+}
 
 /**
  * 整集离线下载：
@@ -146,11 +159,14 @@ export async function runDownloadJob(opts: DownloadJobOptions): Promise<void> {
   };
 
   // —— 解析（重试 2 次） ——
+  // 播放列表本身也走本站代理拉取：直连片源站时浏览器会被 CORS 拦住，
+  // 解析失败是下载失败的第一现场（见 toProxyUrl）。
+  const proxiedUrl = toProxyUrl(url);
   let parsed: ParsedPlaylist;
   let lastErr: unknown;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      parsed = await parseM3u8Playlist(url, 0, undefined, { stripLeadAd: true });
+      parsed = await parseM3u8Playlist(proxiedUrl, 0, undefined, { stripLeadAd: true });
       lastErr = undefined;
       break;
     } catch (err) {
