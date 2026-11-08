@@ -161,6 +161,7 @@ export async function runDownloadJob(opts: DownloadJobOptions): Promise<void> {
   // —— 解析（重试 2 次） ——
   // 播放列表本身也走本站代理拉取：直连片源站时浏览器会被 CORS 拦住，
   // 解析失败是下载失败的第一现场（见 toProxyUrl）。
+  // 429 限流时立即重试只会再吃 429：等几秒再试。
   const proxiedUrl = toProxyUrl(url);
   let parsed: ParsedPlaylist;
   let lastErr: unknown;
@@ -171,6 +172,10 @@ export async function runDownloadJob(opts: DownloadJobOptions): Promise<void> {
       break;
     } catch (err) {
       lastErr = err;
+      if (attempt === 0) {
+        const is429 = err instanceof Error && err.message.includes('429');
+        await new Promise((r) => setTimeout(r, is429 ? 4000 : 1000));
+      }
     }
   }
   if (lastErr || !parsed!) {

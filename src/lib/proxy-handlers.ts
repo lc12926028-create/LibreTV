@@ -106,6 +106,16 @@ export async function handleProxyRequest(req: Request, targetUrl: string): Promi
         { headers, signal: controller.signal },
         { headerTimeoutMs: HEADER_TIMEOUT_MS }
       );
+      // 上游限流（429）：立即重试只会再吃 429。按 Retry-After 或退避延迟后重试。
+      if (result.res.status === 429 && attempt < MAX_RETRIES) {
+        const retryAfter = result.res.headers.get('retry-after');
+        const waitMs = retryAfter
+          ? Math.min(Math.max(parseInt(retryAfter, 10) * 1000, 1000), 8000)
+          : 3000 * (attempt + 1);
+        try { await result.res.body?.cancel(); } catch { /* 忽略 */ }
+        await new Promise((r) => setTimeout(r, waitMs));
+        continue;
+      }
       response = result.res;
       finalUrl = result.finalUrl;
       lastError = null;
