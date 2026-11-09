@@ -91,6 +91,7 @@ export const db = new Dexie('libretv') as Dexie & {
   segmentMeta: EntityTable<SegmentMetaEntry, 'key'>;
   downloads: EntityTable<DownloadTaskEntry, 'id'>;
   favorites: EntityTable<FavoriteEntry, 'id'>;
+  syncTombstones: EntityTable<SyncTombstone, 'key'>;
 };
 
 db.version(1).stores({
@@ -113,6 +114,20 @@ db.version(3).stores({
 // v4：收藏的影片（点播源）
 db.version(4).stores({
   favorites: 'id, timestamp',
+});
+
+// v5：同步删除墓碑（本机删掉的历史/收藏，同步时以 deleted=1 推到云端，
+// 否则别的设备拉取时会把已删的条目又带回来）
+export interface SyncTombstone {
+  /** `${kind}:${id}`，kind 为 history | favorites */
+  key: string;
+  kind: 'history' | 'favorites';
+  id: string;
+  deletedAt: number;
+}
+
+db.version(5).stores({
+  syncTombstones: 'key, deletedAt',
 });
 
 export const MAX_HISTORY = 100;
@@ -156,12 +171,21 @@ export async function updateHistoryProgress(
 }
 
 export async function removeHistory(sourceKey: string, vodId: string): Promise<void> {
-  await db.history.delete(`${sourceKey}_${vodId}`);
+  const id = `${sourceKey}_${vodId}`;
+  await db.history.delete(id);
+  // 同步墓碑：让别的设备也删掉这一条
+  await db.syncTombstones.put({ key: `history:${id}`, kind: 'history', id, deletedAt: Date.now() });
 }
 
 export async function clearAllHistory(): Promise<void> {
   // 一并清进度表：否则从历史重新打开时可能取到已清空的旧进度
+  const all = await db.history.toArray();
   await Promise.all([db.history.clear(), db.progress.clear()]);
+  // 清空也要同步：每条都留一个墓碑
+  const now = Date.now();
+  await db.syncTombstones.bulkPut(
+    all.map((h) => ({ key: `history:${h.id}`, kind: 'history' as const, id: h.id, deletedAt: now }))
+  );
 }
 
 /** 收藏一集影片（同一影片多次收藏只保留一条，时间刷新到最新） */
@@ -171,11 +195,18 @@ export async function addFavorite(entry: Omit<FavoriteEntry, 'id' | 'timestamp'>
 }
 
 export async function removeFavorite(sourceKey: string, vodId: string): Promise<void> {
-  await db.favorites.delete(`${sourceKey}_${vodId}`);
+  const id = `${sourceKey}_${vodId}`;
+  await db.favorites.delete(id);
+  await db.syncTombstones.put({ key: `favorites:${id}`, kind: 'favorites', id, deletedAt: Date.now() });
 }
 
 export async function clearAllFavorites(): Promise<void> {
+  const all = await db.favorites.toArray();
   await db.favorites.clear();
+  const now = Date.now();
+  await db.syncTombstones.bulkPut(
+    all.map((f) => ({ key: `favorites:${f.id}`, kind: 'favorites' as const, id: f.id, deletedAt: now }))
+  );
 }
 
 export function progressKeyOf(sourceKey: string, vodId: string, episodeIndex: number): string {

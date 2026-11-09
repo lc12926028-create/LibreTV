@@ -20,14 +20,21 @@ import {
   type FavoriteEntry,
   type HistoryEntry,
 } from '@/lib/db';
+import {
+  clearSyncCode,
+  getLastSyncAt,
+  getSyncCode,
+  setSyncCode,
+  syncNow,
+} from '@/lib/sync';
 import { buildWatchUrl, cn, formatRelativeTime, formatTime } from '@/lib/utils';
 import { resolveSource, useAppStore } from '@/lib/store';
 import { useToast } from '@/components/toast';
 
 /**
  * 「我的」页面：观看历史 + 我的收藏。
- * 数据都在本机 IndexedDB（与顶栏时钟图标的历史抽屉、播放页收藏按钮共用同一张表），
- * 不登录、不上传，换设备不互通。
+ * 数据默认只存本机 IndexedDB；输同步口令后可与云端同步，手机/iPad/Mac 共用同一份记录。
+ * 同步后端是 Cloudflare Worker + D1（sync.moontvplus.top），口令鉴权。
  */
 
 type Tab = 'history' | 'favorites';
@@ -37,6 +44,31 @@ export default function MyPage() {
   const [query, setQuery] = useState('');
   const [confirmClear, setConfirmClear] = useState(false);
   const { toast } = useToast();
+
+  // —— 跨设备同步 ——
+  const [syncCode, setSyncCodeState] = useState(() => getSyncCode() ?? '');
+  const [syncing, setSyncing] = useState(false);
+  const [lastSyncAt, setLastSyncAt] = useState(() => getLastSyncAt());
+  const hasSyncCode = syncCode.trim().length > 0;
+
+  const doSync = async () => {
+    const code = syncCode.trim();
+    if (!code) {
+      toast('请先输入同步口令', 'warning');
+      return;
+    }
+    setSyncing(true);
+    try {
+      const r = await syncNow(code);
+      setSyncCode(code);
+      setLastSyncAt(r.at);
+      toast(`同步完成：历史 ${r.historyCount} 条，收藏 ${r.favoritesCount} 条`, 'success');
+    } catch (err) {
+      toast(err instanceof Error ? err.message : '同步失败', 'error');
+    } finally {
+      setSyncing(false);
+    }
+  };
 
   const history = useLiveQuery(
     () => db.history.orderBy('timestamp').reverse().limit(MAX_HISTORY).toArray(),
@@ -68,8 +100,51 @@ export default function MyPage() {
       <main className="flex-1 max-w-3xl w-full mx-auto px-4 py-6">
         <h1 className="text-xl font-bold text-content mb-1">我的</h1>
         <p className="text-xs text-faint mb-5">
-          观看历史与收藏只保存在本机浏览器，不登录、不上传。
+          观看历史与收藏默认只保存在本机浏览器；输同步口令后可与云端同步，手机、iPad、Mac 共用同一份记录。
         </p>
+
+        {/* 跨设备同步 */}
+        <section className="card p-3 mb-5 space-y-2">
+          <div className="text-sm font-medium text-content">跨设备同步</div>
+          <div className="flex items-center gap-2">
+            <input
+              type="text"
+              inputMode="text"
+              autoComplete="off"
+              className="input flex-1 h-9 text-sm"
+              placeholder="输入同步口令（8 位）"
+              value={syncCode}
+              maxLength={32}
+              onChange={(e) => setSyncCodeState(e.target.value)}
+              aria-label="同步口令"
+            />
+            <button
+              className="btn-primary btn-sm shrink-0"
+              onClick={doSync}
+              disabled={syncing || !hasSyncCode}
+            >
+              {syncing ? '同步中...' : '立即同步'}
+            </button>
+            {hasSyncCode && (
+              <button
+                className="btn-ghost btn-sm shrink-0"
+                onClick={() => {
+                  clearSyncCode();
+                  setSyncCodeState('');
+                  setLastSyncAt(0);
+                  toast('已清除同步口令，本机记录保留', 'info');
+                }}
+              >
+                清除口令
+              </button>
+            )}
+          </div>
+          <p className="text-xs text-faint">
+            {lastSyncAt > 0
+              ? `上次同步：${formatRelativeTime(lastSyncAt)}`
+              : '还没同步过。口令在三台设备上输一次即可，同步后各设备的历史与收藏会合并。'}
+          </p>
+        </section>
 
         <div className="flex items-center gap-2 mb-4">
           <button
