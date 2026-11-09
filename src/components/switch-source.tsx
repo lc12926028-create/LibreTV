@@ -80,6 +80,8 @@ export function SwitchSourceModal({
   const { toast } = useToast();
   const [candidates, setCandidates] = useState<Candidate[]>([]);
   const [phase, setPhase] = useState<'searching' | 'testing' | 'done'>('searching');
+  /** 默认只显示最快的 3 个可下载源（2026-11-09 用户要求：源太多太乱）；展开后看全部 */
+  const [showAll, setShowAll] = useState(false);
   /** 封面加载失败记录（按卡片 key）；失败后降级为占位图标，避免破图 */
   const [imgFailed, setImgFailed] = useState<Record<string, boolean>>({});
   const panelRef = useRef<HTMLDivElement>(null);
@@ -192,6 +194,21 @@ export function SwitchSourceModal({
     return msA - msB;
   });
 
+  // 默认只显示最快的 3 个可下载源（当前播放的源始终保留，方便对照）；
+  // 其余源收起来，点「显示全部」再展开。配置里的源一个不少，别的片还能用。
+  const TOP_DOWNLOADABLE = 3;
+  const visible = useMemo(() => {
+    if (showAll) return sorted;
+    const top3 = sorted.filter((c) => c.downloadable === true).slice(0, TOP_DOWNLOADABLE);
+    const seen = new Set(top3.map((c) => `${c.source.key}_${c.result.vodId}`));
+    const current = sorted.find(
+      (c) => c.source.key === currentSourceKey && String(c.result.vodId) === String(currentVodId)
+    );
+    const out = [...top3];
+    if (current && !seen.has(`${current.source.key}_${current.result.vodId}`)) out.unshift(current);
+    return out;
+  }, [sorted, showAll, currentSourceKey, currentVodId]);
+
   const switchTo = (c: Candidate) => {
     if (!c.episodes) {
       toast('该源无可用播放资源', 'warning');
@@ -236,7 +253,9 @@ export function SwitchSourceModal({
                 ? '正在搜索各资源...'
                 : phase === 'testing'
                   ? '正在测试各资源速率...'
-                  : `共 ${sorted.length} 个来源 · ${sorted.filter((c) => c.ok).length} 个可用 · ${sorted.filter((c) => c.downloadable).length} 个可下载`}
+                  : showAll
+                    ? `共 ${sorted.length} 个来源 · ${sorted.filter((c) => c.ok).length} 个可用 · ${sorted.filter((c) => c.downloadable).length} 个可下载`
+                    : `只显示最快的 ${TOP_DOWNLOADABLE} 个可下载源（共 ${sorted.length} 个来源 · ${sorted.filter((c) => c.downloadable).length} 个可下载）`}
             </p>
           </div>
           <button className="p-1.5 rounded-md text-muted hover:text-content hover:bg-hover" onClick={onClose} aria-label="关闭">
@@ -251,8 +270,9 @@ export function SwitchSourceModal({
         ) : sorted.length === 0 ? (
           <EmptyState variant="plain" title="其他点播源未找到同名资源" />
         ) : (
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-            {sorted.map((c) => {
+          <>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              {visible.map((c) => {
               const isCurrent = c.source.key === currentSourceKey && String(c.result.vodId) === String(currentVodId);
               const cardKey = `${c.source.key}_${c.result.vodId}`;
               const img = c.result.pic;
@@ -305,7 +325,22 @@ export function SwitchSourceModal({
                 </button>
               );
             })}
-          </div>
+            </div>
+            {sorted.length > visible.length && (
+              <div className="mt-4 text-center">
+                <button className="btn-ghost btn-sm" onClick={() => setShowAll(true)}>
+                  显示全部 {sorted.length} 个源
+                </button>
+              </div>
+            )}
+            {showAll && sorted.length > TOP_DOWNLOADABLE && (
+              <div className="mt-4 text-center">
+                <button className="btn-ghost btn-sm" onClick={() => setShowAll(false)}>
+                  只显示最快的 {TOP_DOWNLOADABLE} 个可下载源
+                </button>
+              </div>
+            )}
+          </>
         )}
       </div>
     </div>
