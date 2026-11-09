@@ -100,6 +100,9 @@ export function Header({ showSearch = false }: { showSearch?: boolean }) {
             <HeaderLink href="/live" active={pathname === '/live'}>
               直播
             </HeaderLink>
+            <HeaderLink href="/my" active={pathname === '/my'}>
+              我的
+            </HeaderLink>
             <HeaderLink href="/about" active={pathname === '/about'}>
               关于
             </HeaderLink>

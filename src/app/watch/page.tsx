@@ -5,6 +5,7 @@ import dynamic from 'next/dynamic';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { useQuery } from '@tanstack/react-query';
+import { useLiveQuery } from 'dexie-react-hooks';
 import { api } from '@/lib/client-api';
 // 播放器（artplayer + hls.js）按需加载：拆出独立 chunk，不占首屏 First Load JS
 const PlayerShell = dynamic(() => import('@/components/player-shell').then((m) => m.PlayerShell), {
@@ -23,8 +24,10 @@ import { useAuth } from '@/components/auth';
 import { resolveSource, useAppStore } from '@/lib/store';
 import { qualityKey } from '@/lib/quality';
 import {
+  addFavorite,
   clearProgress,
   progressKeyOf,
+  removeFavorite,
   saveProgress,
   updateHistoryProgress,
   upsertHistory,
@@ -89,6 +92,28 @@ function WatchContent() {
     if (episodes.length > 0) return Math.min(Math.max(indexParam, 0), episodes.length - 1);
     return indexParam;
   }, [episodes, indexParam]);
+
+  // 收藏状态（IndexedDB 实时查询）：「我的」页面读同一张表
+  const favoriteEntry = useLiveQuery(
+    () => (sourceKey && vodId ? db.favorites.get(`${sourceKey}_${vodId}`) : undefined),
+    [sourceKey, vodId]
+  );
+  const isFavorite = Boolean(favoriteEntry);
+  const toggleFavorite = useCallback(() => {
+    if (!sourceKey || !vodId) return;
+    if (isFavorite) {
+      void removeFavorite(sourceKey, vodId);
+    } else {
+      void addFavorite({
+        sourceKey,
+        sourceUrl: source?.url,
+        vodId,
+        title: videoTitle,
+        pic: detailQuery.data?.videoInfo?.cover,
+        totalEpisodes: episodes.length,
+      });
+    }
+  }, [sourceKey, vodId, isFavorite, source, videoTitle, detailQuery.data, episodes.length]);
 
   const goEpisode = useCallback(
     (index: number) => {
@@ -209,6 +234,14 @@ function WatchContent() {
             </p>
           </div>
           <div className="ml-auto flex items-center gap-2">
+            <button
+              className={cn('btn-ghost btn-sm', isFavorite && 'text-warning')}
+              onClick={toggleFavorite}
+              disabled={!sourceKey || !vodId}
+              title={isFavorite ? '取消收藏' : '收藏到「我的」'}
+            >
+              {isFavorite ? '★ 已收藏' : '☆ 收藏'}
+            </button>
             <button
               className="btn-ghost btn-sm"
               onClick={() => {

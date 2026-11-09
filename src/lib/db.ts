@@ -35,6 +35,19 @@ export interface ProgressEntry {
   updatedAt: number;
 }
 
+/** 收藏的影片（点播源）：只存定位信息，进播放页时按需拉详情，与观看历史同款思路 */
+export interface FavoriteEntry {
+  /** 主键：`${sourceKey}_${vodId}` */
+  id: string;
+  sourceKey: string;
+  sourceUrl?: string;
+  vodId: string;
+  title: string;
+  pic?: string;
+  totalEpisodes?: number;
+  timestamp: number;
+}
+
 export interface SearchHistoryEntry {
   text: string;
   timestamp: number;
@@ -77,6 +90,7 @@ export const db = new Dexie('libretv') as Dexie & {
   liveProbe: EntityTable<LiveProbeEntry & { url: string }, 'url'>;
   segmentMeta: EntityTable<SegmentMetaEntry, 'key'>;
   downloads: EntityTable<DownloadTaskEntry, 'id'>;
+  favorites: EntityTable<FavoriteEntry, 'id'>;
 };
 
 db.version(1).stores({
@@ -94,6 +108,11 @@ db.version(2).stores({
 db.version(3).stores({
   segmentMeta: 'key, episodeKey, lastAccess',
   downloads: 'id, createdAt',
+});
+
+// v4：收藏的影片（点播源）
+db.version(4).stores({
+  favorites: 'id, timestamp',
 });
 
 export const MAX_HISTORY = 100;
@@ -143,6 +162,20 @@ export async function removeHistory(sourceKey: string, vodId: string): Promise<v
 export async function clearAllHistory(): Promise<void> {
   // 一并清进度表：否则从历史重新打开时可能取到已清空的旧进度
   await Promise.all([db.history.clear(), db.progress.clear()]);
+}
+
+/** 收藏一集影片（同一影片多次收藏只保留一条，时间刷新到最新） */
+export async function addFavorite(entry: Omit<FavoriteEntry, 'id' | 'timestamp'>): Promise<void> {
+  const id = `${entry.sourceKey}_${entry.vodId}`;
+  await db.favorites.put({ ...entry, id, timestamp: Date.now() });
+}
+
+export async function removeFavorite(sourceKey: string, vodId: string): Promise<void> {
+  await db.favorites.delete(`${sourceKey}_${vodId}`);
+}
+
+export async function clearAllFavorites(): Promise<void> {
+  await db.favorites.clear();
 }
 
 export function progressKeyOf(sourceKey: string, vodId: string, episodeIndex: number): string {
