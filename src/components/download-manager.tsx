@@ -292,7 +292,7 @@ export function DownloadManager({ isOpen, onClose }: { isOpen: boolean; onClose:
             {(t.status === 'downloading' || t.status === 'paused' || t.status === 'completed') && t.total > 0 && (
               <div className="h-1.5 rounded-full bg-chip overflow-hidden">
                 <div
-                  className="h-full bg-accent transition-all"
+                  className="h-full bg-success transition-all"
                   style={{ width: `${t.total > 0 ? Math.min(100, Math.round((t.finished / t.total) * 100)) : 0}%` }}
                 />
               </div>
