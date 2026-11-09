@@ -5,6 +5,7 @@ import { useRouter, useSearchParams } from 'next/navigation';
 import { useQuery } from '@tanstack/react-query';
 import { Header } from '@/components/header';
 import { RecommendSection } from '@/components/douban-section';
+import { HomeRows } from '@/components/home-rows';
 import { DetailModal } from '@/components/detail-modal';
 import { AggregatedCard, aggregateResults } from '@/components/video-card';
 import { useAppStore, resolveSource, isInDisabledSubscription, isSourceDisabled } from '@/lib/store';
@@ -45,6 +46,7 @@ function HomeContent() {
   const yellowFilter = useAppStore((s) => s.yellowFilter);
   const sourceHealth = useAppStore((s) => s.sourceHealth);
   const subscriptions = useAppStore((s) => s.subscriptions);
+  const recommendSource = useAppStore((s) => s.recommendSource);
   const [input, setInput] = useState(urlQuery);
   const [detailItem, setDetailItem] = useState<SearchResultItem | null>(null);
   /** 流式搜索中已结算的源（data 就绪前用于增量渲染） */
@@ -364,15 +366,24 @@ function HomeContent() {
           </section>
         )}
 
-        {/* 首页推荐（有搜索时隐藏） */}
-        {!urlQuery && (
-          <RecommendSection
-            onPick={(title) => {
-              setInput(title);
-              runSearch(title);
-            }}
-          />
-        )}
+        {/* 首页推荐（有搜索时隐藏）：方案 B「Netflix 式横排」；
+            推荐源设为 Bangumi 时仍走旧版新番放送视图 */}
+        {!urlQuery &&
+          (recommendSource === 'bangumi' ? (
+            <RecommendSection
+              onPick={(title) => {
+                setInput(title);
+                runSearch(title);
+              }}
+            />
+          ) : (
+            <HomeRows
+              onPick={(title) => {
+                setInput(title);
+                runSearch(title);
+              }}
+            />
+          ))}
       </main>
 
       <SiteFooter />

@@ -118,6 +118,14 @@ body {
   .scrollbar-thin::-webkit-scrollbar-thumb {
     @apply bg-line rounded-full;
   }
+  /* 横向滚动行：隐藏滚动条（手指/触控板滑动，不靠滚动条定位） */
+  .no-scrollbar {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
 }
 
 /* 行数截断 */
