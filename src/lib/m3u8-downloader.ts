@@ -29,6 +29,7 @@ function toProxyUrl(url: string): string {
 
 const DL_CACHE_NAME = 'libretv-dl-v1';
 const SEGMENT_TIMEOUT_MS = 20_000;
+const SEGMENT_STALL_MS = 60_000;
 const MAX_SEGMENT_RETRIES = 3;
 
 export class PauseResumeController {
@@ -90,9 +91,52 @@ export async function clearDownloadChunks(taskId: string): Promise<void> {
 }
 
 async function fetchSegment(url: string, signal: AbortSignal): Promise<ArrayBuffer> {
-  const res = await fetch(url, { signal: AbortSignal.any([AbortSignal.timeout(SEGMENT_TIMEOUT_MS), signal]), headers: { Accept: '*/*' } });
+  // 仅对「响应头等待」限时 20s：拿到响应头后清除计时器，body 不再受固定整段时限。
+  // 之前 AbortSignal.timeout(20s) 作用于整个 fetch + arrayBuffer()，分片稍大/网稍慢
+  // 就 20 秒切断，重试 3 次也一样失败——「开头快、过会儿分片下载失败」就是这个原因。
+  // 与服务端 /api/proxy 的 header-only 超时同款。
+  const headerController = new AbortController();
+  const headerTimer = setTimeout(() => headerController.abort(), SEGMENT_TIMEOUT_MS);
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      signal: AbortSignal.any([headerController.signal, signal]),
+      headers: { Accept: '*/*' },
+    });
+  } finally {
+    clearTimeout(headerTimer);
+  }
   if (!res.ok) throw new Error(`分片 HTTP ${res.status}`);
-  return res.arrayBuffer();
+  // body 流式读：无固定整段时限，只在 60 秒无数据时判定为停滞并中断。
+  const reader = res.body?.getReader();
+  if (!reader) return res.arrayBuffer();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  const onOuterAbort = () => { try { reader.cancel(); } catch { /* 忽略 */ } };
+  signal.addEventListener('abort', onOuterAbort, { once: true });
+  try {
+    for (;;) {
+      let stallTimer: ReturnType<typeof setTimeout> | undefined;
+      const stall = new Promise<never>((_, reject) => {
+        stallTimer = setTimeout(() => reject(new Error('分片读取停滞超过 60 秒')), SEGMENT_STALL_MS);
+      });
+      try {
+        const { done, value } = await Promise.race([reader.read(), stall]);
+        clearTimeout(stallTimer);
+        if (done) break;
+        if (value) { chunks.push(value); total += value.byteLength; }
+      } catch (err) {
+        clearTimeout(stallTimer);
+        throw err;
+      }
+    }
+  } finally {
+    signal.removeEventListener('abort', onOuterAbort);
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) { out.set(c, offset); offset += c.byteLength; }
+  return out.buffer;
 }
 
 /**
