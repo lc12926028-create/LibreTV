@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { api } from '@/lib/client-api';
+import { PROXY_BASE, isProxiedUri } from '@/lib/m3u8';
 import type { SourceConfig, SearchResultItem } from '@/lib/types';
 import { buildWatchUrl, cn } from '@/lib/utils';
 import { useAppStore, resolveSource } from '@/lib/store';
@@ -15,7 +16,41 @@ import { useFocusTrap } from './use-focus-trap';
 /**
  * 换源面板：跨源按标题搜索 → 匹配同名/同前缀资源 → 并发测速（详情接口耗时）→ 按速度排序展示。
  * 切换时保留当前集数索引（旧版 switchToResource 逻辑的去 DOM 化重写）。
+ *
+ * 可下载优先（2026-11-09 用户要求）：详情接口耗时只反映源站 API 快慢，
+ * 反映不了视频流本身通不通——iKun 源接口 685ms 最快，但其 CDN 域名已挂，
+ * 播不了也下不了。所以每源再探一次当集播放地址：经本站代理拉取，能拿到
+ * 有效 m3u8（或 MP4 响应头 200）才算可下载；排序时可下载的排前面。
  */
+
+/** 单源下载探测死线：与服务端画质探测同量级，避免一个慢源拖住整批 */
+const DOWNLOAD_PROBE_TIMEOUT_MS = 8000;
+
+/**
+ * 探指定集的播放地址是否可下载：经本站代理拉取（与下载器同款 toProxyUrl）。
+ * m3u8：读文本，含 #EXTM3U 才算有效；MP4 等直链：响应头 200 即算，不读 body。
+ * 超时/失败/无地址一律视为不可下载（不抛错，由调用方降级）。
+ */
+async function probeDownloadable(episodeUrl: string | undefined, signal: AbortSignal): Promise<boolean> {
+  if (!episodeUrl) return false;
+  const target = isProxiedUri(episodeUrl) ? episodeUrl : PROXY_BASE + encodeURIComponent(episodeUrl);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), DOWNLOAD_PROBE_TIMEOUT_MS);
+  try {
+    const res = await fetch(target, { signal: AbortSignal.any([controller.signal, signal]) });
+    if (!res.ok) return false;
+    if (episodeUrl.toLowerCase().includes('.m3u8')) {
+      const text = await res.text();
+      return text.includes('#EXTM3U');
+    }
+    try { await res.body?.cancel(); } catch { /* 忽略 */ }
+    return true;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 interface Candidate {
   source: SourceConfig;
@@ -23,6 +58,8 @@ interface Candidate {
   ms?: number;
   ok?: boolean;
   episodes?: number;
+  /** 当集播放地址经代理可拉取（m3u8 有效 / MP4 响应头 200） */
+  downloadable?: boolean;
 }
 
 export function SwitchSourceModal({
@@ -104,7 +141,7 @@ export function SwitchSourceModal({
           if (exact) matched.push({ source: s, result: exact });
         }
 
-        // 2) 并发测速（详情接口耗时）并获取集数
+        // 2) 并发测速（详情接口耗时）并获取集数，同时探当集是否可下载
         setPhase('testing');
         await Promise.all(
           matched.map(async (c) => {
@@ -113,6 +150,12 @@ export function SwitchSourceModal({
             c.ok = r.ok;
             c.ms = r.ms;
             c.episodes = r.detail?.episodes.length ?? 0;
+            // 可下载探测：只探当集（currentIndex 超界则探第 1 集），与测速并行，
+            // 8 秒死线内无结果即判不可下载，不拖住整批。
+            const eps = r.detail?.episodes ?? [];
+            const epUrl = eps[currentIndex] ?? eps[0];
+            c.downloadable = await probeDownloadable(epUrl, controller.signal);
+            if (cancelled) return;
           })
         );
         if (cancelled) return;
@@ -139,6 +182,11 @@ export function SwitchSourceModal({
     const aCurrent = a.source.key === currentSourceKey && String(a.result.vodId) === String(currentVodId);
     const bCurrent = b.source.key === currentSourceKey && String(b.result.vodId) === String(currentVodId);
     if (aCurrent !== bCurrent) return aCurrent ? -1 : 1;
+    // 可下载优先：接口快慢反映不了视频流通不通，可下载的排前面；
+    // 同组内再按接口耗时排序，接口失败的沉底。
+    const aDl = a.downloadable === true ? 0 : 1;
+    const bDl = b.downloadable === true ? 0 : 1;
+    if (aDl !== bDl) return aDl - bDl;
     const msA = a.ok ? a.ms ?? 99_999 : 99_999;
     const msB = b.ok ? b.ms ?? 99_999 : 99_999;
     return msA - msB;
@@ -188,7 +236,7 @@ export function SwitchSourceModal({
                 ? '正在搜索各资源...'
                 : phase === 'testing'
                   ? '正在测试各资源速率...'
-                  : `共 ${sorted.length} 个来源 · ${sorted.filter((c) => c.ok).length} 个可用`}
+                  : `共 ${sorted.length} 个来源 · ${sorted.filter((c) => c.ok).length} 个可用 · ${sorted.filter((c) => c.downloadable).length} 个可下载`}
             </p>
           </div>
           <button className="p-1.5 rounded-md text-muted hover:text-content hover:bg-hover" onClick={onClose} aria-label="关闭">
@@ -247,7 +295,12 @@ export function SwitchSourceModal({
                     <div className="text-xs font-medium text-content truncate" title={c.source.name}>
                       {c.source.name}
                     </div>
-                    <div className="text-xs text-faint mt-0.5">{c.episodes ? `${c.episodes} 集` : '无资源'}</div>
+                    <div className="text-xs text-faint mt-0.5 flex items-center gap-1.5">
+                      <span>{c.episodes ? `${c.episodes} 集` : '无资源'}</span>
+                      {c.downloadable && (
+                        <span className="bg-success-solid/85 text-white rounded px-1 py-px text-[10px] leading-none">可下载</span>
+                      )}
+                    </div>
                   </div>
                 </button>
               );
