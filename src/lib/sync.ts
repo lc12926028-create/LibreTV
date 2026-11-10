@@ -25,20 +25,37 @@ export function getSyncCode(): string | null {
 }
 
 export function setSyncCode(code: string): void {
-  localStorage.setItem(SYNC_CODE_KEY, code.trim());
+  try {
+    localStorage.setItem(SYNC_CODE_KEY, code.trim());
+  } catch {
+    // 服务端预渲染 / 隐私模式下无 localStorage，静默跳过
+  }
 }
 
 export function clearSyncCode(): void {
-  localStorage.removeItem(SYNC_CODE_KEY);
-  localStorage.removeItem(SYNC_LAST_AT_KEY);
+  try {
+    localStorage.removeItem(SYNC_CODE_KEY);
+    localStorage.removeItem(SYNC_LAST_AT_KEY);
+  } catch {
+    // 服务端预渲染 / 隐私模式下无 localStorage，静默跳过
+  }
 }
 
 export function getLastSyncAt(): number {
-  return Number(localStorage.getItem(SYNC_LAST_AT_KEY) || 0);
+  try {
+    return Number(localStorage.getItem(SYNC_LAST_AT_KEY) || 0);
+  } catch {
+    // 服务端预渲染时无 localStorage，返回 0（客户端注水后会读到真实值）
+    return 0;
+  }
 }
 
 function setLastSyncAt(t: number): void {
-  localStorage.setItem(SYNC_LAST_AT_KEY, String(t));
+  try {
+    localStorage.setItem(SYNC_LAST_AT_KEY, String(t));
+  } catch {
+    // 服务端预渲染 / 隐私模式下无 localStorage，静默跳过
+  }
 }
 
 export interface SyncResult {
