@@ -23,6 +23,7 @@ import { Icon } from '@/components/icon';
 import { useAuth } from '@/components/auth';
 import { resolveSource, useAppStore } from '@/lib/store';
 import { qualityKey } from '@/lib/quality';
+import { buildDownloadDedupKey } from '@/lib/download-dedup';
 import {
   addFavorite,
   clearProgress,
@@ -251,6 +252,10 @@ function WatchContent() {
                   // 多集才带集数后缀；单集影片（含电影）文件名就是纯标题
                   title: `${videoTitle}${episodes.length > 1 ? ` 第${currentIndex + 1}集` : ''}`,
                   format: 'MP4',
+                  // 防重复：同一源同一集再次点下载时拦截（与播放进度 episodeKey 同口径）；
+                  // 纯直连链接（无 source/vod）不带键，不拦截
+                  dedupKey:
+                    sourceKey && vodId ? buildDownloadDedupKey(sourceKey, vodId, currentIndex) : undefined,
                 });
                 // 「已加入下载队列」由 DownloadManager 在真正入队后提示：
                 // 这里先提示的话，用户随后取消保存位置会出现「已加入→已取消」的矛盾

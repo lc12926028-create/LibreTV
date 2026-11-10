@@ -75,6 +75,11 @@ export interface DownloadTaskEntry {
   title: string;
   /** 输出格式 */
   format: 'TS' | 'MP4';
+  /**
+   * 下载去重键：`${sourceKey}:${vodId}:${episodeIndex}`（见 lib/download-dedup.ts）。
+   * 同一源同一集正在下载或已下载过时禁止重复入队；改动前已有的旧记录无此字段。
+   */
+  dedupKey?: string;
   status: DownloadStatus;
   finished: number;
   total: number;
@@ -128,6 +133,11 @@ export interface SyncTombstone {
 
 db.version(5).stores({
   syncTombstones: 'key, deletedAt',
+});
+
+// v6：下载任务去重键索引（同一源 + 同一影片 + 同一集，防重复下载）
+db.version(6).stores({
+  downloads: 'id, createdAt, dedupKey',
 });
 
 export const MAX_HISTORY = 100;

@@ -12,6 +12,7 @@ import {
   type DownloadProgress,
 } from '@/lib/m3u8-downloader';
 import { detectSavingCapability, pickSaveTarget } from '@/lib/download-saver';
+import { findDuplicateDownload } from '@/lib/download-dedup';
 
 /**
  * 全局下载管理器（UI 采用本站 Drawer 模式）：
@@ -30,6 +31,8 @@ export interface AddDownloadPayload {
   url: string;
   title: string;
   format?: 'TS' | 'MP4';
+  /** 下载去重键：`${sourceKey}:${vodId}:${episodeIndex}`（见 lib/download-dedup.ts）；无则不拦截 */
+  dedupKey?: string;
 }
 
 /** 运行中的任务句柄（不进持久化） */
@@ -45,6 +48,8 @@ export function DownloadManager({ isOpen, onClose }: { isOpen: boolean; onClose:
   const [tasks, setTasks] = useState<DownloadTaskEntry[]>([]);
   const [capability, setCapability] = useState<'fs-access' | 'memory'>('memory');
   const running = useRef(new Map<string, RunningHandle>());
+  /** 正在走入队流程（查库 → 选保存位置 → 写库）的去重键：防快速连点重复入队 */
+  const pendingDedupKeys = useRef(new Set<string>());
 
   const refresh = useCallback(() => {
     void db.downloads.orderBy('createdAt').reverse().toArray().then(setTasks);
@@ -142,36 +147,66 @@ export function DownloadManager({ isOpen, onClose }: { isOpen: boolean; onClose:
       if (!detail?.url || !detail?.title) return;
       void (async () => {
         const format = detail.format ?? 'MP4';
-        const id = `dl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-        const entry: DownloadTaskEntry = {
-          id,
-          url: detail.url,
-          title: detail.title,
-          format,
-          status: 'waiting',
-          finished: 0,
-          total: 0,
-          errorNum: 0,
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-        };
-        // 用户手势内预选保存目标（FS Access 弹窗必须在手势内）
+        const dedupKey = detail.dedupKey;
+        // 防重复：同一源同一集正在下载或已下载过，直接拦截。
+        // 必须在弹保存位置选择器之前检查，否则重复点下载还会弹出文件选择器。
+        // pendingDedupKeys 挡住快速连点：查库 → 选目标 → 写库这段异步窗口内，
+        // 第二次点击查库时还看不到第一条记录。
+        let heldKey: string | null = null;
         try {
-          const target = await pickSaveTarget(`${detail.title}.${format.toLowerCase()}`);
-          (globalThis as unknown as { __dlSaveTarget?: { id: string; target: import('@/lib/download-saver').SaveTarget } }).__dlSaveTarget = {
-            id,
-            target,
-          };
-        } catch (err) {
-          if (err instanceof Error && err.message.includes('取消')) {
-            toast('已取消下载', 'info');
-            return;
+          if (dedupKey) {
+            if (pendingDedupKeys.current.has(dedupKey)) {
+              toast(`《${detail.title}》已在下载队列中`, 'info');
+              return;
+            }
+            const existing = await db.downloads.where('dedupKey').equals(dedupKey).toArray();
+            const dup = findDuplicateDownload(existing, dedupKey);
+            if (dup) {
+              toast(
+                dup.state === 'completed'
+                  ? `《${detail.title}》已下载过`
+                  : `《${detail.title}》已在下载队列中`,
+                'info'
+              );
+              return;
+            }
+            pendingDedupKeys.current.add(dedupKey);
+            heldKey = dedupKey;
           }
+          const id = `dl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+          const entry: DownloadTaskEntry = {
+            id,
+            url: detail.url,
+            title: detail.title,
+            format,
+            dedupKey,
+            status: 'waiting',
+            finished: 0,
+            total: 0,
+            errorNum: 0,
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+          };
+          // 用户手势内预选保存目标（FS Access 弹窗必须在手势内）
+          try {
+            const target = await pickSaveTarget(`${detail.title}.${format.toLowerCase()}`);
+            (globalThis as unknown as { __dlSaveTarget?: { id: string; target: import('@/lib/download-saver').SaveTarget } }).__dlSaveTarget = {
+              id,
+              target,
+            };
+          } catch (err) {
+            if (err instanceof Error && err.message.includes('取消')) {
+              toast('已取消下载', 'info');
+              return;
+            }
+          }
+          await db.downloads.put(entry);
+          refresh();
+          scheduleNext();
+          toast(`《${detail.title}》已加入下载队列`, 'success');
+        } finally {
+          if (heldKey) pendingDedupKeys.current.delete(heldKey);
         }
-        await db.downloads.put(entry);
-        refresh();
-        scheduleNext();
-        toast(`《${detail.title}》已加入下载队列`, 'success');
       })();
     };
 
