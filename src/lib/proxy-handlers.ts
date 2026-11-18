@@ -156,11 +156,11 @@ export async function handleProxyRequest(req: Request, targetUrl: string): Promi
     if (v) outHeaders.set(name, v);
   }
   // fetch 会自动解压，转发时必须去掉长度相关头避免浏览器二次解压
-  // 图片基本不变：长缓存交给浏览器与边缘 CDN（分片 / key 仍保守 1 小时）
-  outHeaders.set(
-    'Cache-Control',
-    contentType.startsWith('image/') ? 'public, max-age=2592000' : 'public, max-age=3600'
-  );
+  // 一律 no-store：Netlify Durable 缓存按路径建键、不含查询串，所有
+  // /api/proxy?url=* 会共用同一条缓存条目——曾被第一份穿过代理的播放页
+  // HTML 投毒，此后每个代理请求（连鉴权都被短路）全返回同一份 HTML。
+  // 代理目标全靠查询串区分，任何按路径缓存的长缓存都不安全，故全分支 no-store。
+  outHeaders.set('Cache-Control', 'no-store');
   outHeaders.set('Access-Control-Allow-Origin', '*');
 
   return new NextResponse(response.body, {

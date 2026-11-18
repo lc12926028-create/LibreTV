@@ -8,7 +8,8 @@ import { StreamingTransmuxer } from './mp4-transmuxer';
  * Access-Control-Allow-Origin: *，直连可行；而全量走代理时一集要打 1600+
  * 次 Netlify 函数调用、约 700MB 流量全走免费额度，下到一半被限流打死
  * （三源分片直连实测全通，失败只发生在代理链路）。
- * 因此解析与分片拉取先直连源站，仅网络/CORS 失败才回退代理；
+ * 因此解析与分片拉取先直连源站，直连任一失败（网络/CORS/HTTP 错误/
+ * 头超时停滞）才回退代理；
  * 对 CORS 封闭的源，回退后行为与旧版全程代理一致。
  * 注意：经代理拉到的播放列表已被代理重写（分片/key 均指回代理，见
  * proxy-handlers），解析出的地址本身就是代理地址，不会再被直连逻辑改动。
@@ -205,6 +206,15 @@ async function fetchSegmentOnce(url: string, signal: AbortSignal): Promise<Array
       parseRetryAfterMs(res.headers.get('retry-after'))
     );
   }
+  if (isProxiedUri(url)) {
+    const ct = res.headers.get('content-type') || '';
+    if (ct.includes('text/html')) {
+      // 经代理的响应若是 HTML，绝不可能是合法分片：多半是代理缓存被投毒
+      // 或上游返回了错误页。视为失败让上层处理，绝不写进 Cache Storage，
+      // 否则断点缓存会被 HTML 污染、续传时拼出损坏文件。
+      throw new SegmentFetchError(`代理返回 HTML 而非分片数据（HTTP ${res.status}）`, res.status);
+    }
+  }
   // body 流式读：无固定整段时限，只在 60 秒无数据时判定为停滞并中断。
   const reader = res.body?.getReader();
   if (!reader) return res.arrayBuffer();
@@ -240,9 +250,12 @@ async function fetchSegmentOnce(url: string, signal: AbortSignal): Promise<Array
 /**
  * 分片拉取（直连优先、代理兜底）：
  * - 地址已是代理形态，或该 origin 本次会话内已证实直连不通 → 直接走代理；
- * - 直连在网络/CORS 层失败（fetch 以 TypeError 拒绝）→ 记下 origin 并回退代理；
- * - HTTP 错误（SegmentFetchError）与读取停滞不回退：连接本身是通的，
- *   交给上层重试退避处理，回退代理只会重复同样的上游错误。
+ * - 直连任一失败都回退代理：网络/CORS（TypeError）、HTTP 错误
+ *   （SegmentFetchError）、头超时/停滞（AbortError）一视同仁——浏览器出口
+ *   与服务端出口是两条不同的路（如非标端口宿主在浏览器侧停滞、CDN 对
+ *   浏览器直连回 403），直连失败不代表代理也会失败；代理再失败才抛给
+ *   上层走重试退避。旧口径只回退 TypeError，金鹰分片因此全灭。
+ * - 仅用户取消（外层 signal 已 aborted）不回退，直接抛错停任务。
  */
 async function fetchSegment(url: string, signal: AbortSignal): Promise<ArrayBuffer> {
   if (isProxiedUri(url)) return fetchSegmentOnce(url, signal);
@@ -252,28 +265,36 @@ async function fetchSegment(url: string, signal: AbortSignal): Promise<ArrayBuff
     return await fetchSegmentOnce(url, signal);
   } catch (err) {
     if (signal.aborted) throw err;
-    if (err instanceof TypeError) {
-      directFailedOrigins.add(origin);
-      return fetchSegmentOnce(toProxyUrl(url), signal);
-    }
-    throw err;
+    directFailedOrigins.add(origin);
+    return fetchSegmentOnce(toProxyUrl(url), signal);
   }
 }
 
-/** AES 密钥拉取：与分片同一口径（直连网络/CORS 失败才回退代理） */
+/** AES 密钥拉取：与分片同一口径（直连任一失败即回退代理，含头超时） */
 async function fetchAesKey(uri: string, signal: AbortSignal): Promise<ArrayBuffer> {
   const attempt = async (u: string): Promise<ArrayBuffer> => {
-    const res = await fetch(u, { signal });
+    // 与分片一致的头超时：仅限响应头等待 20s，拿到头后清除计时器，
+    // 避免非标端口宿主在浏览器侧无声停滞把整个任务挂死
+    const headerController = new AbortController();
+    const headerTimer = setTimeout(() => headerController.abort(), SEGMENT_TIMEOUT_MS);
+    let res: Response;
+    try {
+      res = await fetch(u, { signal: AbortSignal.any([headerController.signal, signal]) });
+    } finally {
+      clearTimeout(headerTimer);
+    }
     if (!res.ok) throw new Error(`解密密钥加载失败：HTTP ${res.status}`);
     return res.arrayBuffer();
   };
+  if (isProxiedUri(uri)) return attempt(uri);
+  const origin = originOf(uri);
+  if (directFailedOrigins.has(origin)) return attempt(toProxyUrl(uri));
   try {
     return await attempt(uri);
   } catch (err) {
-    if (!isProxiedUri(uri) && err instanceof TypeError && !signal.aborted) {
-      return attempt(toProxyUrl(uri));
-    }
-    throw err;
+    if (signal.aborted) throw err;
+    directFailedOrigins.add(origin);
+    return attempt(toProxyUrl(uri));
   }
 }
 

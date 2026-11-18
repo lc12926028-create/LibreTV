@@ -299,4 +299,134 @@ describe('runDownloadJob · 直连优先 / 代理兜底 / 播放页', () => {
     expect(collected.flatMap((c) => [...c])).toEqual([9, 8]);
     expect(fetched).toContain('https://cdn-b.example.com/v/index.m3u8');
   });
+
+  it('分片直连 HTTP 错误（403）→ 回退代理并完成下载', async () => {
+    stubCacheStorage();
+    const fetched: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: unknown) => {
+        const url = String(input);
+        fetched.push(url);
+        if (url === 'https://cdn-c.example.com/v/index.m3u8') {
+          return new Response(MEDIA_PLAYLIST, { status: 200 });
+        }
+        if (url.startsWith('https://cdn-c.example.com/v/seg')) {
+          // 直连被拒：HTTP 错误（SegmentFetchError），不是 TypeError——
+          // 旧口径不回退代理、原地重试到失败，金鹰分片全灭即此形态
+          return new Response('Forbidden', { status: 403 });
+        }
+        if (url.startsWith('/api/proxy?url=')) {
+          const target = decodeURIComponent(url.slice('/api/proxy?url='.length));
+          if (target === 'https://cdn-c.example.com/v/seg0.ts') {
+            return new Response(new Uint8Array([7, 7]), { status: 200 });
+          }
+          if (target === 'https://cdn-c.example.com/v/seg1.ts') {
+            return new Response(new Uint8Array([6]), { status: 200 });
+          }
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      })
+    );
+
+    const collected: Uint8Array[] = [];
+    await runDownloadJob({
+      taskId: 'test-c',
+      url: 'https://cdn-c.example.com/v/index.m3u8',
+      title: 't',
+      format: 'TS',
+      signal: new AbortController().signal,
+      pause: new PauseResumeController(),
+      onProgress: () => {},
+      target: memoryTarget(collected),
+    });
+
+    expect(collected.flatMap((c) => [...c])).toEqual([7, 7, 6]);
+    expect(fetched.some((u) => u.startsWith('/api/proxy?url='))).toBe(true);
+  });
+
+  it('分片直连头超时停滞（AbortError）→ 回退代理并完成下载', async () => {
+    stubCacheStorage();
+    const fetched: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: unknown) => {
+        const url = String(input);
+        fetched.push(url);
+        if (url === 'https://cdn-d.example.com/v/index.m3u8') {
+          return new Response(MEDIA_PLAYLIST, { status: 200 });
+        }
+        if (url.startsWith('https://cdn-d.example.com/v/seg')) {
+          // 非标端口宿主在浏览器侧停滞 → 头超时 abort，fetch 以 AbortError 拒绝
+          const err = new Error('The user aborted a request.');
+          err.name = 'AbortError';
+          throw err;
+        }
+        if (url.startsWith('/api/proxy?url=')) {
+          const target = decodeURIComponent(url.slice('/api/proxy?url='.length));
+          if (target === 'https://cdn-d.example.com/v/seg0.ts') {
+            return new Response(new Uint8Array([5]), { status: 200 });
+          }
+          if (target === 'https://cdn-d.example.com/v/seg1.ts') {
+            return new Response(new Uint8Array([4]), { status: 200 });
+          }
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      })
+    );
+
+    const collected: Uint8Array[] = [];
+    await runDownloadJob({
+      taskId: 'test-d',
+      url: 'https://cdn-d.example.com/v/index.m3u8',
+      title: 't',
+      format: 'TS',
+      signal: new AbortController().signal,
+      pause: new PauseResumeController(),
+      onProgress: () => {},
+      target: memoryTarget(collected),
+    });
+
+    expect(collected.flatMap((c) => [...c])).toEqual([5, 4]);
+    expect(fetched.some((u) => u.startsWith('/api/proxy?url='))).toBe(true);
+  });
+
+  it('代理把 HTML 当 200 返回 → 视为分片失败，绝不当分片写入缓存', async () => {
+    const store = stubCacheStorage();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: unknown) => {
+        const url = String(input);
+        if (url === 'https://cdn-e.example.com/v/index.m3u8') {
+          return new Response(MEDIA_PLAYLIST, { status: 200 });
+        }
+        if (url.startsWith('https://cdn-e.example.com/v/seg')) {
+          throw new TypeError('Failed to fetch');
+        }
+        if (url.startsWith('/api/proxy?url=')) {
+          // 代理缓存投毒形态：任何目标都回同一份 HTML + 200
+          return new Response('<html><body>play page</body></html>', {
+            status: 200,
+            headers: { 'Content-Type': 'text/html; charset=utf-8' },
+          });
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      })
+    );
+
+    await expect(
+      runDownloadJob({
+        taskId: 'test-e',
+        url: 'https://cdn-e.example.com/v/index.m3u8',
+        title: 't',
+        format: 'TS',
+        signal: new AbortController().signal,
+        pause: new PauseResumeController(),
+        onProgress: () => {},
+        target: memoryTarget([]),
+      })
+    ).rejects.toThrow(/分片 \d 下载失败/);
+    // HTML 没被当成分片存进断点缓存
+    expect([...store.keys()].filter((k) => k.includes('test-e'))).toHaveLength(0);
+  }, 15_000);
 });
