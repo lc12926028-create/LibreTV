@@ -55,6 +55,26 @@ export function DownloadManager({ isOpen, onClose }: { isOpen: boolean; onClose:
     void db.downloads.orderBy('createdAt').reverse().toArray().then(setTasks);
   }, []);
 
+  // —— 僵尸任务自愈（加载时执行一次） ——
+  // 页面刷新/浏览器关闭会让 status=downloading 的记录失去运行句柄：调度器只
+  // 启动 waiting、暂停按钮对它无操作、去重又把 downloading 视为「正在下载」
+  // 永久拦截同源同集——此前注释自称「等待调度器自愈」，实际永不自愈。
+  // 加载时把无句柄的 downloading 一律改判 error：去重不拦 error，用户可直接
+  // 点「继续」重试；已下载分片仍在 Cache Storage，重试时自动续传不重下。
+  useEffect(() => {
+    void (async () => {
+      const all = await db.downloads.toArray();
+      const zombies = all.filter(
+        (t) => t.status === 'downloading' && !running.current.has(t.id)
+      );
+      if (!zombies.length) return;
+      for (const z of zombies) {
+        await db.downloads.update(z.id, { status: 'error', updatedAt: Date.now() });
+      }
+      refresh();
+    })();
+  }, [refresh]);
+
   const updateEntry = useCallback(async (id: string, patch: Partial<DownloadTaskEntry>) => {
     await db.downloads.update(id, { ...patch, updatedAt: Date.now() });
     refresh();
@@ -247,7 +267,7 @@ export function DownloadManager({ isOpen, onClose }: { isOpen: boolean; onClose:
       }
       return;
     }
-    void handle; // downloading 且无 handle：状态漂移，等待调度器自愈
+    void handle; // downloading 且无 handle：状态漂移记录已在加载时改判 error（见僵尸自愈），此处无需处理
   };
 
   const onCancel = async (entry: DownloadTaskEntry) => {

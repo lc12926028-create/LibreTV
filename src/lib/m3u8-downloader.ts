@@ -1,17 +1,68 @@
 import { parseM3u8Playlist, type ParsedPlaylist } from './m3u8-parse';
-import { PROXY_BASE, isProxiedUri } from './m3u8';
+import { PROXY_BASE, isProxiedUri, makeAbsolute } from './m3u8';
 import { StreamingTransmuxer } from './mp4-transmuxer';
 
 /**
- * 把下载地址改写为经本站代理的地址。
- * 播放器侧同样走 /api/proxy（见 player-shell），下载若直连片源站，
- * 浏览器会被上游缺失的 CORS 头拦住——播放能看、下载失败就是这个原因。
- * 代理会对 m3u8 做重写（分片/key 均指回代理，见 proxy-handlers），
- * 因此解析出的分片与密钥地址本身就是代理地址，后续拉取无需再改写。
+ * 把下载地址改写为经本站代理的地址（兜底通道）。
+ * 2026-11-18 起下载改为「直连优先、代理兜底」：实测主要片源 CDN 均返回
+ * Access-Control-Allow-Origin: *，直连可行；而全量走代理时一集要打 1600+
+ * 次 Netlify 函数调用、约 700MB 流量全走免费额度，下到一半被限流打死
+ * （三源分片直连实测全通，失败只发生在代理链路）。
+ * 因此解析与分片拉取先直连源站，仅网络/CORS 失败才回退代理；
+ * 对 CORS 封闭的源，回退后行为与旧版全程代理一致。
+ * 注意：经代理拉到的播放列表已被代理重写（分片/key 均指回代理，见
+ * proxy-handlers），解析出的地址本身就是代理地址，不会再被直连逻辑改动。
  */
 function toProxyUrl(url: string): string {
   if (isProxiedUri(url)) return url;
   return PROXY_BASE + encodeURIComponent(url);
+}
+
+/** 直连已证实失败（CORS/网络层）的源站 origin：本页会话内后续请求直接走代理，避免每片都先撞一次墙 */
+const directFailedOrigins = new Set<string>();
+
+function originOf(url: string): string {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * 从播放页 HTML 中提取 m3u8 直链。
+ * 部分源（如金鹰点播）的分集地址是播放页而非 m3u8：页面里以 JS 变量形式
+ * 内嵌真正的列表地址（<播放页>/index.m3u8）。优先取引号内的完整地址，
+ * 其次裸写的绝对/相对地址；提取不到返回 undefined，由调用方走原报错路径。
+ */
+export function extractM3u8Url(html: string, pageUrl: string): string | undefined {
+  const quoted = html.match(/["']([^"'\s<>]+\.m3u8(?:\?[^"'\s<>]*)?)["']/i);
+  const bare =
+    quoted ??
+    html.match(/(?:https?:)?\/\/[^\s"'<>]+\.m3u8(?:\?[^\s"'<>]*)?/i) ??
+    html.match(/[^\s"'<>]+\.m3u8(?:\?[^\s"'<>]*)?/i);
+  let found = quoted ? quoted[1] : bare?.[0];
+  if (!found) return undefined;
+  if (found.startsWith('//')) found = `https:${found}`;
+  return makeAbsolute(found, pageUrl);
+}
+
+/**
+ * 分集地址归一：不是 .m3u8 结尾时按播放页处理——经代理取页面并提取其中
+ * 的 m3u8 直链；取不到/提取失败则原样返回（后续解析会按原路径报错）。
+ */
+async function resolveEntryUrl(url: string, signal: AbortSignal): Promise<string> {
+  if (isProxiedUri(url)) return url;
+  const path = url.split(/[?#]/)[0];
+  if (path.toLowerCase().endsWith('.m3u8')) return url;
+  try {
+    const res = await fetch(toProxyUrl(url), { signal, headers: { Accept: 'text/html,*/*' } });
+    if (!res.ok) return url;
+    const html = await res.text();
+    return extractM3u8Url(html, url) ?? url;
+  } catch {
+    return url;
+  }
 }
 
 /**
@@ -90,7 +141,48 @@ export async function clearDownloadChunks(taskId: string): Promise<void> {
   } catch { /* 忽略 */ }
 }
 
-async function fetchSegment(url: string, signal: AbortSignal): Promise<ArrayBuffer> {
+/** Retry-After / 退避等待上限：再久不如让任务失败、由用户重试 */
+const RETRY_AFTER_CAP_MS = 30_000;
+const SEGMENT_RETRY_BASE_MS = 1000;
+
+/** 分片拉取失败：HTTP 失败时携带状态码与上游 Retry-After，供重试退避决策 */
+export class SegmentFetchError extends Error {
+  readonly status?: number;
+  readonly retryAfterMs?: number;
+
+  constructor(message: string, status?: number, retryAfterMs?: number) {
+    super(message);
+    this.name = 'SegmentFetchError';
+    this.status = status;
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+/** 解析 Retry-After 头（秒数或 HTTP 日期），并夹到上限内 */
+export function parseRetryAfterMs(header: string | null): number | undefined {
+  if (!header) return undefined;
+  const trimmed = header.trim();
+  if (/^\d+$/.test(trimmed)) {
+    return Math.min(parseInt(trimmed, 10) * 1000, RETRY_AFTER_CAP_MS);
+  }
+  const at = Date.parse(trimmed);
+  if (!Number.isNaN(at)) {
+    return Math.min(Math.max(at - Date.now(), 0), RETRY_AFTER_CAP_MS);
+  }
+  return undefined;
+}
+
+/**
+ * 分片重试等待：指数退避（1s → 2s → 4s…）与上游 Retry-After 取大者。
+ * 旧实现固定 1/2/3 秒且不看 Retry-After，撞上游 429 时越重试越被限。
+ */
+export function segmentRetryDelayMs(retryIndex: number, err: unknown): number {
+  const backoff = SEGMENT_RETRY_BASE_MS * 2 ** retryIndex;
+  const retryAfter = err instanceof SegmentFetchError ? err.retryAfterMs ?? 0 : 0;
+  return Math.min(Math.max(backoff, retryAfter), RETRY_AFTER_CAP_MS);
+}
+
+async function fetchSegmentOnce(url: string, signal: AbortSignal): Promise<ArrayBuffer> {
   // 仅对「响应头等待」限时 20s：拿到响应头后清除计时器，body 不再受固定整段时限。
   // 之前 AbortSignal.timeout(20s) 作用于整个 fetch + arrayBuffer()，分片稍大/网稍慢
   // 就 20 秒切断，重试 3 次也一样失败——「开头快、过会儿分片下载失败」就是这个原因。
@@ -106,7 +198,13 @@ async function fetchSegment(url: string, signal: AbortSignal): Promise<ArrayBuff
   } finally {
     clearTimeout(headerTimer);
   }
-  if (!res.ok) throw new Error(`分片 HTTP ${res.status}`);
+  if (!res.ok) {
+    throw new SegmentFetchError(
+      `分片 HTTP ${res.status}`,
+      res.status,
+      parseRetryAfterMs(res.headers.get('retry-after'))
+    );
+  }
   // body 流式读：无固定整段时限，只在 60 秒无数据时判定为停滞并中断。
   const reader = res.body?.getReader();
   if (!reader) return res.arrayBuffer();
@@ -137,6 +235,46 @@ async function fetchSegment(url: string, signal: AbortSignal): Promise<ArrayBuff
   let offset = 0;
   for (const c of chunks) { out.set(c, offset); offset += c.byteLength; }
   return out.buffer;
+}
+
+/**
+ * 分片拉取（直连优先、代理兜底）：
+ * - 地址已是代理形态，或该 origin 本次会话内已证实直连不通 → 直接走代理；
+ * - 直连在网络/CORS 层失败（fetch 以 TypeError 拒绝）→ 记下 origin 并回退代理；
+ * - HTTP 错误（SegmentFetchError）与读取停滞不回退：连接本身是通的，
+ *   交给上层重试退避处理，回退代理只会重复同样的上游错误。
+ */
+async function fetchSegment(url: string, signal: AbortSignal): Promise<ArrayBuffer> {
+  if (isProxiedUri(url)) return fetchSegmentOnce(url, signal);
+  const origin = originOf(url);
+  if (directFailedOrigins.has(origin)) return fetchSegmentOnce(toProxyUrl(url), signal);
+  try {
+    return await fetchSegmentOnce(url, signal);
+  } catch (err) {
+    if (signal.aborted) throw err;
+    if (err instanceof TypeError) {
+      directFailedOrigins.add(origin);
+      return fetchSegmentOnce(toProxyUrl(url), signal);
+    }
+    throw err;
+  }
+}
+
+/** AES 密钥拉取：与分片同一口径（直连网络/CORS 失败才回退代理） */
+async function fetchAesKey(uri: string, signal: AbortSignal): Promise<ArrayBuffer> {
+  const attempt = async (u: string): Promise<ArrayBuffer> => {
+    const res = await fetch(u, { signal });
+    if (!res.ok) throw new Error(`解密密钥加载失败：HTTP ${res.status}`);
+    return res.arrayBuffer();
+  };
+  try {
+    return await attempt(uri);
+  } catch (err) {
+    if (!isProxiedUri(uri) && err instanceof TypeError && !signal.aborted) {
+      return attempt(toProxyUrl(uri));
+    }
+    throw err;
+  }
 }
 
 /**
@@ -202,27 +340,29 @@ export async function runDownloadJob(opts: DownloadJobOptions): Promise<void> {
     });
   };
 
-  // —— 解析（重试 2 次） ——
-  // 播放列表本身也走本站代理拉取：直连片源站时浏览器会被 CORS 拦住，
-  // 解析失败是下载失败的第一现场（见 toProxyUrl）。
-  // 429 限流时立即重试只会再吃 429：等几秒再试。
-  const proxiedUrl = toProxyUrl(url);
-  let parsed: ParsedPlaylist;
+  // —— 解析（直连优先、代理兜底） ——
+  // 先把播放页地址归一成 m3u8 直链（见 resolveEntryUrl），再直连解析；
+  // 直连失败（CORS/网络/上游错误）才回退本站代理——代理会对列表做重写，
+  // 回退解析出的分片/key 地址即代理形态，后续拉取自动全程走代理。
+  // 两次尝试之间留等待：429 限流时立即重试只会再吃 429。
+  const entryUrl = await resolveEntryUrl(url, signal);
+  const candidates = isProxiedUri(entryUrl) ? [entryUrl] : [entryUrl, toProxyUrl(entryUrl)];
+  let parsed: ParsedPlaylist | undefined;
   let lastErr: unknown;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let i = 0; i < candidates.length; i++) {
     try {
-      parsed = await parseM3u8Playlist(proxiedUrl, 0, undefined, { stripLeadAd: true });
+      parsed = await parseM3u8Playlist(candidates[i], 0, undefined, { stripLeadAd: true });
       lastErr = undefined;
       break;
     } catch (err) {
       lastErr = err;
-      if (attempt === 0) {
+      if (i < candidates.length - 1) {
         const is429 = err instanceof Error && err.message.includes('429');
         await new Promise((r) => setTimeout(r, is429 ? 4000 : 1000));
       }
     }
   }
-  if (lastErr || !parsed!) {
+  if (lastErr || !parsed) {
     throw new Error(`播放列表解析失败：${lastErr instanceof Error ? lastErr.message : '未知错误'}`);
   }
   if (parsed.byterange) throw new Error('该集使用 BYTERANGE 分片，暂不支持下载');
@@ -233,9 +373,7 @@ export async function runDownloadJob(opts: DownloadJobOptions): Promise<void> {
   // —— AES key 预取 ——
   let aesKey: ArrayBuffer | undefined;
   if (parsed.aesConf) {
-    const res = await fetch(parsed.aesConf.uri, { signal });
-    if (!res.ok) throw new Error(`解密密钥加载失败：HTTP ${res.status}`);
-    aesKey = await res.arrayBuffer();
+    aesKey = await fetchAesKey(parsed.aesConf.uri, signal);
   }
 
   // —— 并发下载分片（Cache Storage 断点） ——
@@ -254,6 +392,10 @@ export async function runDownloadJob(opts: DownloadJobOptions): Promise<void> {
       if (signal.aborted) return;
       await pause.waitIfPaused();
       const index = ++cursor; // 1 基
+      // 多个 worker 会在 waitIfPaused 的让行点扎堆通过 while 检查再依次自增，
+      // cursor 可冲过 total：越界 worker 没有对应分片，直接退出，
+      // 否则会在重试后误报「分片 N 下载失败」把整集拖死（小集数必现、大集数尾部偶现）
+      if (index > total) return;
       if (signal.aborted) return;
       await pause.waitIfPaused();
       const cached = await cache.match(new Request(chunkKey(index)));
@@ -268,9 +410,12 @@ export async function runDownloadJob(opts: DownloadJobOptions): Promise<void> {
         try {
           buffer = await fetchSegment(seg.url, signal);
           break;
-        } catch {
+        } catch (err) {
           if (signal.aborted) return;
-          await new Promise((r) => setTimeout(r, 1000 * (retry + 1)));
+          // 指数退避 + 尊重上游 Retry-After（见 segmentRetryDelayMs）
+          if (retry < MAX_SEGMENT_RETRIES - 1) {
+            await new Promise((r) => setTimeout(r, segmentRetryDelayMs(retry, err)));
+          }
         }
       }
       if (!buffer) {
